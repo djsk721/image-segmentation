@@ -126,10 +126,10 @@ class EarlyStopping():
             
 
 # Read csv file of data
-files_dir = 'lgg-mri-segmentation/kaggle_3m'
+files_dir = 'kaggle_3m'
 file_paths = glob(f'{files_dir}/*/*[0-9].tif')
 
-csv_path = 'lgg-mri-segmentation/kaggle_3m/data.csv'
+csv_path = 'kaggle_3m/data.csv'
 df = pd.read_csv(csv_path)
 
 # Missing values handling
@@ -234,53 +234,53 @@ lr_scheduler = ReduceLROnPlateau(optimizer=optimizer, patience=2,factor=0.2)
 
 history = training_loop(epochs, model, train_loader, valid_loader, optimizer, loss_fn, lr_scheduler)
 
-# Test Evaluation
-with torch.no_grad():
-    running_IoU = 0
-    running_dice = 0
-    running_loss = 0
-    for i, data in enumerate(test_loader):
-        img, mask = data
-        img, mask = img.to(device), mask.to(device)
-        predictions = model(img)
-        predictions = predictions.squeeze(1)
-        running_dice += dice_pytorch(predictions, mask).sum().item()
-        running_IoU += iou_pytorch(predictions, mask).sum().item()
-        loss = loss_fn(predictions, mask)
-        running_loss += loss.item() * img.size(0)
-    loss = running_loss / len(test_dataset)
-    dice = running_dice / len(test_dataset)
-    IoU = running_IoU / len(test_dataset)
+# # Test Evaluation
+# with torch.no_grad():
+#     running_IoU = 0
+#     running_dice = 0
+#     running_loss = 0
+#     for i, data in enumerate(test_loader):
+#         img, mask = data
+#         img, mask = img.to(device), mask.to(device)
+#         predictions = model(img)
+#         predictions = predictions.squeeze(1)
+#         running_dice += dice_pytorch(predictions, mask).sum().item()
+#         running_IoU += iou_pytorch(predictions, mask).sum().item()
+#         loss = loss_fn(predictions, mask)
+#         running_loss += loss.item() * img.size(0)
+#     loss = running_loss / len(test_dataset)
+#     dice = running_dice / len(test_dataset)
+#     IoU = running_IoU / len(test_dataset)
     
-    print(f'Tests: loss: {loss} | Mean IoU: {IoU} | Dice coefficient: {dice}')
+#     print(f'Tests: loss: {loss} | Mean IoU: {IoU} | Dice coefficient: {dice}')
 
 
-# Testing
-width = 3
-columns = 10
-n_examples = columns * width
+# # Testing
+# width = 3
+# columns = 10
+# n_examples = columns * width
 
-fig, axs = plt.subplots(columns, width, figsize=(7*width , 7*columns), constrained_layout=True)
-red_patch = mpatches.Patch(color='red', label='The red data')
-fig.legend(loc='upper right',handles=[
-    mpatches.Patch(color='red', label='Ground truth'),
-    mpatches.Patch(color='green', label='Predicted abnormality')])
-i = 0
-with torch.no_grad():
-    for data in test_loader:
-        image, mask = data
-        mask = mask[0]
-        if not mask.byte().any():
-            continue
-        image = image.to(device)
-        prediction = model(image).to('cpu')[0][0]
-        prediction = torch.where(prediction > 0.5, 1, 0)
-        prediction_edges = prediction - binary_dilation(prediction)
-        ground_truth = mask - binary_dilation(mask)
-        image[0, 0, ground_truth.bool()] = 1
-        image[0, 1, prediction_edges.bool()] = 1
+# fig, axs = plt.subplots(columns, width, figsize=(7*width , 7*columns), constrained_layout=True)
+# red_patch = mpatches.Patch(color='red', label='The red data')
+# fig.legend(loc='upper right',handles=[
+#     mpatches.Patch(color='red', label='Ground truth'),
+#     mpatches.Patch(color='green', label='Predicted abnormality')])
+# i = 0
+# with torch.no_grad():
+#     for data in test_loader:
+#         image, mask = data
+#         mask = mask[0]
+#         if not mask.byte().any():
+#             continue
+#         image = image.to(device)
+#         prediction = model(image).to('cpu')[0][0]
+#         prediction = torch.where(prediction > 0.5, 1, 0)
+#         prediction_edges = prediction - binary_dilation(prediction)
+#         ground_truth = mask - binary_dilation(mask)
+#         image[0, 0, ground_truth.bool()] = 1
+#         image[0, 1, prediction_edges.bool()] = 1
         
-        axs[i//width][i%width].imshow(image[0].to('cpu').permute(1, 2, 0))
-        if n_examples == i + 1:
-            break
-        i += 1
+#         axs[i//width][i%width].imshow(image[0].to('cpu').permute(1, 2, 0))
+#         if n_examples == i + 1:
+#             break
+#         i += 1
