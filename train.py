@@ -1,186 +1,81 @@
-import os
-import time
+import argparse
+import logging
+import wandb
 from glob import glob
 from tqdm import tqdm
-
-import cv2
-import numpy as np
 import pandas as pd
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 import albumentations as A
-from scipy.ndimage.morphology import binary_dilation
 import segmentation_models_pytorch as smp
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
-
 import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms as T
+from torch.utils.data import DataLoader
+
+from utils.data_loading import MriDataset
+from utils.utils import BCE_dice, dice_pytorch, get_file_row, iou_pytorch, EarlyStopping
+from test import test
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Util
-# function to get data
-def get_file_row(path):
-    """Produces ID of a patient, image and mask filenames from a particular path"""
-    path_no_ext, ext = os.path.splitext(path)
-    filename = os.path.basename(path)
-    
-    patient_id = '_'.join(filename.split('_')[:3]) # Patient ID in the csv file consists of 3 first filename segments
-    
-    return [patient_id, path, f'{path_no_ext}_mask{ext}']
 
-# Create Metrics
-def iou_pytorch(predictions: torch.Tensor, labels: torch.Tensor, e: float = 1e-7):
-    """Calculates Intersection over Union for a tensor of predictions"""
-    predictions = torch.where(predictions > 0.5, 1, 0)
-    labels = labels.byte()
-    
-    intersection = (predictions & labels).float().sum((1, 2))
-    union = (predictions | labels).float().sum((1, 2))
-    
-    iou = (intersection + e) / (union + e)
-    return iou
+def train_model(
+        model,
+        device,
+        epochs: int = 5,
+        batch_size: int = 16,
+        learning_rate: float = 1e-3
+):
+    # Read csv file of data
+    files_dir = 'kaggle_3m'
+    file_paths = glob(f'{files_dir}/*/*[0-9].tif')
 
-def dice_pytorch(predictions: torch.Tensor, labels: torch.Tensor, e: float = 1e-7):
-    """Calculates Dice coefficient for a tensor of predictions"""
-    predictions = torch.where(predictions > 0.5, 1, 0)
-    labels = labels.byte()
-    
-    intersection = (predictions & labels).float().sum((1, 2))
-    return ((2 * intersection) + e) / (predictions.float().sum((1, 2)) + labels.float().sum((1, 2)) + e)
+    csv_path = 'kaggle_3m/data.csv'
+    df = pd.read_csv(csv_path)
 
-def BCE_dice(output, target, alpha=0.01):
-    bce = torch.nn.functional.binary_cross_entropy(output, target)
-    soft_dice = 1 - dice_pytorch(output, target).mean()
-    return bce + alpha * soft_dice
+    # Missing values handling
+    imputer = SimpleImputer(strategy="most_frequent")
 
+    df = pd.DataFrame(imputer.fit_transform(df), columns=df.columns)
 
-# DataSet Class 
-class MriDataset(Dataset):
-    def __init__(self, df, transform=None, mean=0.5, std=0.25):
-        super(MriDataset, self).__init__()
-        self.df = df
-        self.transform = transform
-        self.mean = mean
-        self.std = std
-        
-        
-    def __len__(self):
-        return len(self.df)
-        
-    def __getitem__(self, idx, raw=False):
-        row = self.df.iloc[idx]
-        img = cv2.imread(row['image_filename'], cv2.IMREAD_UNCHANGED)
-        mask = cv2.imread(row['mask_filename'], cv2.IMREAD_GRAYSCALE)
-        if raw:
-            return img, mask
-        
-        if self.transform:
-            augmented = self.transform(image=img, mask=mask)
-            image, mask = augmented['image'], augmented['mask']
-        
-        img = T.functional.to_tensor(img)
-        mask = mask // 255
-        mask = torch.Tensor(mask)
-        return img, mask
+    filenames_df = pd.DataFrame((get_file_row(filename) for filename in file_paths), columns=['Patient', 'image_filename', 'mask_filename'])
 
-# EarlyStopping
-class EarlyStopping():
-    """
-    Stops training when loss stops decreasing in a PyTorch module.
-    """
-    def __init__(self, patience:int = 6, min_delta: float = 0, weights_path: str = 'weights.pt'):
-        """
-        :param patience: number of epochs of non-decreasing loss before stopping
-        :param min_delta: minimum difference between best and new loss that is considered
-            an improvement
-        :paran weights_path: Path to the file that should store the model's weights
-        """
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = float('inf')
-        self.weights_path = weights_path
+    df = pd.merge(df, filenames_df, on="Patient")
 
-    def __call__(self, val_loss: float, model: torch.nn.Module):
-        if self.best_loss - val_loss > self.min_delta:
-            self.best_loss = val_loss
-            torch.save(model.state_dict(), self.weights_path)
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        return False
+    # Split data into Train, valid, test
+    train_df, test_df = train_test_split(df, test_size=0.3)
+    test_df, valid_df = train_test_split(test_df, test_size=0.5)
 
-    def load_weights(self, model: torch.nn.Module):
-        """
-        Loads weights of the best model.
-        :param model: model to which the weigths should be loaded
-        """
-        return model.load_state_dict(torch.load(self.weights_path))
-            
+    # Transforming 
+    transform = A.Compose([
+        A.ChannelDropout(p=0.3),
+        A.RandomBrightnessContrast(p=0.3),
+        A.ColorJitter(p=0.3),
+    ])
 
-# Read csv file of data
-files_dir = 'kaggle_3m'
-file_paths = glob(f'{files_dir}/*/*[0-9].tif')
+    train_dataset = MriDataset(train_df, transform)
+    valid_dataset = MriDataset(valid_df)
+    test_dataset = MriDataset(test_df)
 
-csv_path = 'kaggle_3m/data.csv'
-df = pd.read_csv(csv_path)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=1)
 
-# Missing values handling
-imputer = SimpleImputer(strategy="most_frequent")
+    # (Initialize logging)
+    experiment = wandb.init(project='EfficientUNet', resume='allow', anonymous='must')
+    experiment.config.update(
+        dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate)
+    )
+    global_step = 0
 
-df = pd.DataFrame(imputer.fit_transform(df), columns=df.columns)
-
-filenames_df = pd.DataFrame((get_file_row(filename) for filename in file_paths), columns=['Patient', 'image_filename', 'mask_filename'])
-
-df = pd.merge(df, filenames_df, on="Patient")
-
-# Split data into Train, valid, test
-train_df, test_df = train_test_split(df, test_size=0.3)
-test_df, valid_df = train_test_split(test_df, test_size=0.5)
-
-# Transforming 
-transform = A.Compose([
-    A.ChannelDropout(p=0.3),
-    A.RandomBrightnessContrast(p=0.3),
-    A.ColorJitter(p=0.3),
-])
-
-train_dataset = MriDataset(train_df, transform)
-valid_dataset = MriDataset(valid_df)
-test_dataset = MriDataset(test_df)
-
-# DataLoader
-batch_size = 16
-
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=1)
-
-# load model
-model = smp.Unet(
-    encoder_name="efficientnet-b7",
-    encoder_weights="imagenet",
-    in_channels=3,
-    classes=1,
-    activation='sigmoid',
-)
-model.to(device)
-
-# Training
-def training_loop(epochs, model, train_loader, valid_loader, optimizer, loss_fn, lr_scheduler):
-    history = {'train_loss': [], 'val_loss': [], 'val_IoU': [], 'val_dice': []}
+    # history = {'train_loss': [], 'val_loss': [], 'val_IoU': [], 'val_dice': []}
     early_stopping = EarlyStopping(patience=7)
-    
-    for epoch in range(1, epochs + 1):
-        start_time = time.time()
-        
+    loss_fn = BCE_dice
+    optimizer = Adam(model.parameters(), lr=learning_rate)
+    lr_scheduler = ReduceLROnPlateau(optimizer=optimizer, patience=2,factor=0.2)
+
+    for epoch in range(1, epochs + 1): 
         running_loss = 0
         model.train()
         for i, data in enumerate(tqdm(train_loader)):
@@ -193,6 +88,18 @@ def training_loop(epochs, model, train_loader, valid_loader, optimizer, loss_fn,
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+            global_step += 1
+            experiment.log({
+                'train/learning rate': optimizer.param_groups[0]['lr'],
+                'train/train_loss': loss,
+                # 'images': wandb.Image(images[0].cpu()),
+                # 'masks': {
+                #     'true': wandb.Image(true_masks[0].float().cpu()),
+                #     'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
+                # },
+                'train/step': global_step,
+                'train/epoch': epoch
+            })
         
         model.eval()
         with torch.no_grad():
@@ -207,80 +114,95 @@ def training_loop(epochs, model, train_loader, valid_loader, optimizer, loss_fn,
                 running_dice += dice_pytorch(predictions, mask).sum().item()
                 running_IoU += iou_pytorch(predictions, mask).sum().item()
                 loss = loss_fn(predictions, mask)
-                running_valid_loss += loss.item() * img.size(0)
+                loss = loss.item() * img.size(0)
+                running_valid_loss += loss
+
         train_loss = running_loss / len(train_loader.dataset)
         val_loss = running_valid_loss / len(valid_loader.dataset)
         val_dice = running_dice / len(valid_loader.dataset)
         val_IoU = running_IoU / len(valid_loader.dataset)
-        
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['val_IoU'].append(val_IoU)
-        history['val_dice'].append(val_dice)
+        experiment.log({
+            'eval/validation Dice': val_dice,
+            'eval/validation IOU': val_IoU,
+            'eval/val_loss': val_loss
+        })
         print(f'Epoch: {epoch}/{epochs} | Training loss: {train_loss} | Validation loss: {val_loss} | Validation Mean IoU: {val_IoU} '
-         f'| Validation Dice coefficient: {val_dice}')
+            f'| Validation Dice coefficient: {val_dice}')
         
         lr_scheduler.step(val_loss)
         if early_stopping(val_loss, model):
             early_stopping.load_weights(model)
             break
     model.eval()
-    return history
-
-loss_fn = BCE_dice
-optimizer = Adam(model.parameters(), lr=0.001)
-epochs = 60
-lr_scheduler = ReduceLROnPlateau(optimizer=optimizer, patience=2,factor=0.2)
-
-history = training_loop(epochs, model, train_loader, valid_loader, optimizer, loss_fn, lr_scheduler)
-
-# # Test Evaluation
-# with torch.no_grad():
-#     running_IoU = 0
-#     running_dice = 0
-#     running_loss = 0
-#     for i, data in enumerate(test_loader):
-#         img, mask = data
-#         img, mask = img.to(device), mask.to(device)
-#         predictions = model(img)
-#         predictions = predictions.squeeze(1)
-#         running_dice += dice_pytorch(predictions, mask).sum().item()
-#         running_IoU += iou_pytorch(predictions, mask).sum().item()
-#         loss = loss_fn(predictions, mask)
-#         running_loss += loss.item() * img.size(0)
-#     loss = running_loss / len(test_dataset)
-#     dice = running_dice / len(test_dataset)
-#     IoU = running_IoU / len(test_dataset)
-    
-#     print(f'Tests: loss: {loss} | Mean IoU: {IoU} | Dice coefficient: {dice}')
+    test(model, test_loader, device)
+    experiment.finish()
 
 
-# # Testing
-# width = 3
-# columns = 10
-# n_examples = columns * width
+def get_args():
+    parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
+    parser.add_argument('--epochs', '-e', metavar='E', type=int, default=60, help='Number of epochs')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=16, help='Batch size')
+    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-3,
+                        help='Learning rate', dest='lr')
+    parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
+    # parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
+    # parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
+    #                     help='Percent of the data that is used as validation (0-100)')
+    # parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
+    # parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
+    # parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
 
-# fig, axs = plt.subplots(columns, width, figsize=(7*width , 7*columns), constrained_layout=True)
-# red_patch = mpatches.Patch(color='red', label='The red data')
-# fig.legend(loc='upper right',handles=[
-#     mpatches.Patch(color='red', label='Ground truth'),
-#     mpatches.Patch(color='green', label='Predicted abnormality')])
-# i = 0
-# with torch.no_grad():
-#     for data in test_loader:
-#         image, mask = data
-#         mask = mask[0]
-#         if not mask.byte().any():
-#             continue
-#         image = image.to(device)
-#         prediction = model(image).to('cpu')[0][0]
-#         prediction = torch.where(prediction > 0.5, 1, 0)
-#         prediction_edges = prediction - binary_dilation(prediction)
-#         ground_truth = mask - binary_dilation(mask)
-#         image[0, 0, ground_truth.bool()] = 1
-#         image[0, 1, prediction_edges.bool()] = 1
-        
-#         axs[i//width][i%width].imshow(image[0].to('cpu').permute(1, 2, 0))
-#         if n_examples == i + 1:
-#             break
-#         i += 1
+    return parser.parse_args()
+
+if __name__ == '__main__':
+    args = get_args()
+
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info(f'Using device {device}')
+
+    # Change here to adapt to your data
+    # n_channels=1 for grey scale images
+    # n_classes is the number of probabilities you want to get per pixel
+    # load model
+    model = smp.Unet(
+        encoder_name="efficientnet-b7",
+        encoder_weights="imagenet",
+        in_channels=3,
+        classes=1,
+        activation='sigmoid',
+    )
+    model.to(device)
+
+    logging.info(f'Network:\n'
+                 f'\t{3} input channels\n'
+                 f'\t{1} output channels (classes)\n')
+
+    if args.load:
+        state_dict = torch.load(args.load, map_location=device)
+        del state_dict['mask_values']
+        model.load_state_dict(state_dict)
+        logging.info(f'Model loaded from {args.load}')
+
+    model.to(device=device)
+    try:
+        train_model(
+            model=model,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            device=device,
+        )
+    except torch.cuda.OutOfMemoryError:
+        logging.error('Detected OutOfMemoryError! '
+                      'Enabling checkpointing to reduce memory usage, but this slows down training. '
+                      'Consider enabling AMP (--amp) for fast and memory efficient training')
+        torch.cuda.empty_cache()
+        model.use_checkpointing()
+        train_model(
+            model=model,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            device=device,
+        )

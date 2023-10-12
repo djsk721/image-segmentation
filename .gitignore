@@ -6,3 +6,5 @@ pyvenv.cfg
 *.pt
 share
 kaggle_3m
+wandb
+__pycache__
