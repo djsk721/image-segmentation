@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from utils.data_loading import MriDataset
 from utils.utils import BCE_dice, dice_pytorch, get_file_row, iou_pytorch, EarlyStopping
-from test import test
+from testing import test 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -67,14 +67,24 @@ def train_model(
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate)
     )
-    global_step = 0
 
+    global_step = 0
     # history = {'train_loss': [], 'val_loss': [], 'val_IoU': [], 'val_dice': []}
     early_stopping = EarlyStopping(patience=7)
     loss_fn = BCE_dice
     optimizer = Adam(model.parameters(), lr=learning_rate)
     lr_scheduler = ReduceLROnPlateau(optimizer=optimizer, patience=2,factor=0.2)
 
+    logging.info(f'''Starting training:
+    Epochs:          {epochs}
+    Batch size:      {batch_size}
+    Learning rate:   {learning_rate}
+    Training size:   {len(train_dataset)}
+    Validation size: {len(valid_dataset)}
+    Testing size:    {len(test_dataset)}
+    Device:          {device.type}
+    optimizer:       {optimizer}
+    ''')
     for epoch in range(1, epochs + 1): 
         running_loss = 0
         model.train()
@@ -92,11 +102,6 @@ def train_model(
             experiment.log({
                 'train/learning rate': optimizer.param_groups[0]['lr'],
                 'train/train_loss': loss,
-                # 'images': wandb.Image(images[0].cpu()),
-                # 'masks': {
-                #     'true': wandb.Image(true_masks[0].float().cpu()),
-                #     'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                # },
                 'train/step': global_step,
                 'train/epoch': epoch
             })
@@ -126,15 +131,22 @@ def train_model(
             'eval/validation IOU': val_IoU,
             'eval/val_loss': val_loss
         })
-        print(f'Epoch: {epoch}/{epochs} | Training loss: {train_loss} | Validation loss: {val_loss} | Validation Mean IoU: {val_IoU} '
-            f'| Validation Dice coefficient: {val_dice}')
+        logging.info(f'''Valid Information:
+            Epochs:                         {epoch}/{epochs} 
+            Training loss:                  {train_loss}
+            Validation loss:                {val_loss}
+            Validation Mean IoU:            {val_IoU}
+            Validation Dice coefficient:    {val_dice}
+        ''')
+        # print(f'Epoch: {epoch}/{epochs} | Training loss: {train_loss} | Validation loss: {val_loss} | Validation Mean IoU: {val_IoU} '
+        #     f'| Validation Dice coefficient: {val_dice}')
         
         lr_scheduler.step(val_loss)
         if early_stopping(val_loss, model):
             early_stopping.load_weights(model)
             break
     model.eval()
-    test(model, test_loader, device)
+    test(model, test_loader, device, experiment)
     experiment.finish()
 
 
